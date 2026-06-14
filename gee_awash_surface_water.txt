@@ -1,0 +1,471 @@
+"""
+============================================================
+ Spatiotemporal Surface Water Dynamics of the Awash River Basin, Ethiopia (2016–2025): 
+Multi-sensor Fusion of Sentinel-1 and Sentinel-2 Data with Machine Learning Algorithms
+============================================================
+
+Description:
+    This script implements an automated framework for surface water
+    extraction in the Awash River Basin (ARB), Ethiopia, using
+    multi-source Sentinel-1 SAR and Sentinel-2 MSI imagery integrated
+    with ancillary data on the Google Earth Engine (GEE) cloud platform.
+
+    Four machine learning classifiers are evaluated:
+        - Random Forest (RF)
+        - Support Vector Machine (SVM)
+        - Gradient Tree Boost (GTB)
+        - Classification and Regression Tree (CART)
+
+    Training and validation samples are automatically collected using
+    stratified random sampling from the JRC Global Surface Water Dataset
+    (JRC-GSWD) and the Dynamic World (DW) dataset.
+
+Study Area:
+    Awash River Basin (ARB), Ethiopia
+    Temporal Coverage: 2016 – 2025 (seasonal: Winter, Spring, Summer, Autumn)
+
+Requirements:
+    - Google Earth Engine account with a registered project
+Authentication:
+    Run `ee.Authenticate()` once to link your GEE account.
+    Replace 'your_project_ID' with your actual GEE Cloud Project ID.
+
+Usage:
+    1. Set your GEE project ID in ee.Initialize()
+    2. Upload your study area shapefile as a GEE Asset and update the
+       FeatureCollection path in the `table` variable
+    3. Set the desired seasonal date range using start_date / end_date
+    4. Run the script
+
+Authors:
+    Samuel Negussie Bekele, Mulugeta Musie 
+    Water Resources Engineering Department, Adama Science and Technology University
+    Contact Email- saminegu6
+============================================================
+"""
+
+# ============================================================
+# STEP 1: Import Libraries, Authenticate & Initialize GEE
+# ============================================================
+
+import ee       # Google Earth Engine Python API
+import geemap   # Interactive GEE mapping library
+
+# Authenticate your GEE account (only required once per session/environment)
+# This will open a browser window for OAuth authentication
+ee.Authenticate()
+
+# Initialize the Earth Engine session with your GEE Cloud Project ID
+# Replace 'your_project_ID' with your actual project (e.g., 'ee-myproject-2024')
+ee.Initialize(project='your_project_ID')
+
+# Create a geemap interactive map object for visualization
+m = geemap.Map()
+
+# A reference point located within the Awash River Basin, Ethiopia
+# Used to spatially filter the study area feature collection
+geometry = ee.Geometry.Point([38.76589929444579, 9.022385368143977])
+
+# Load the study area shapefile uploaded as a GEE Asset (FeatureCollection)
+# Replace the path below with your actual GEE Asset path
+# Example: "projects/your_project_ID/assets/Awash_Basin_Boundary"
+table = ee.FeatureCollection("projects/your_project_ID/assets/your_shapefile_name")
+
+# Filter the feature collection to the study area using the reference point
+AOI = table.filterBounds(geometry)
+
+# Center the map on the AOI and add it as a layer
+m.centerObject(AOI, zoom=7)
+m.addLayer(AOI, {}, 'Awash River Basin')
+
+# Define Seasonal Date Ranges
+# Modify start_date and end_date to match your target season.
+# Ethiopian seasonal convention used in this study:
+#   Winter  : December  - February  (e.g., '2016-12-01' to '2017-02-28')
+#   Spring  : March     - May       (e.g., '2016-03-01' to '2016-05-31')
+#   Summer  : June      - August    (e.g., '2016-06-01' to '2016-08-31')
+#   Autumn  : September - November  (e.g., '2016-09-01' to '2016-11-30')
+start_date = 'yyyy-mm-dd'   # Replace with your season start (e.g., '2016-06-01')
+end_date   = 'yyyy-mm-dd'   # Replace with your season end   (e.g., '2016-08-31')
+
+
+# ============================================================
+# STEP 2: Load and Process Sentinel-2 MSI Imagery
+# ============================================================
+
+def mask_s2_clouds(image):
+    """Masks clouds and cirrus in a Sentinel-2 image using the QA60 band.
+
+    Args:
+        image (ee.Image): A Sentinel-2 image.
+
+    Returns:
+        ee.Image: A cloud-masked and reflectance-scaled Sentinel-2 image.
+    """
+    qa = image.select('QA60')
+
+    # Bits 10 and 11 represent clouds and cirrus, respectively
+    cloud_bit_mask = 1 << 10
+    cirrus_bit_mask = 1 << 11
+
+    # Both flags must equal zero to indicate clear (cloud-free) conditions
+    mask = (
+        qa.bitwiseAnd(cloud_bit_mask)
+        .eq(0)
+        .And(qa.bitwiseAnd(cirrus_bit_mask).eq(0))
+    )
+
+    # Apply mask and scale reflectance values to [0, 1]
+    return image.updateMask(mask).divide(10000)
+
+
+# Load the Sentinel-2 Harmonized collection filtered by date, AOI, and cloud cover
+S2 = (
+    ee.ImageCollection('COPERNICUS/S2_HARMONIZED')
+    .filterDate(start_date, end_date)
+    .filterBounds(AOI)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))   # Keep granules < 10% cloudy
+    .map(mask_s2_clouds)                                   # Apply cloud mask
+    .median()                                              # Reduce to median composite
+    .clip(AOI)                                             # Clip to study area
+)
+
+# Visualize the Sentinel-2 RGB composite
+rgb_vis = {
+    'min': 0.0,
+    'max': 0.3,
+    'bands': ['B4', 'B3', 'B2'],   # Red, Green, Blue
+}
+m.centerObject(AOI, 12)
+m.add_layer(S2, rgb_vis, 'S2 RGB Composite', shown=False)
+
+# Calculate Spectral Indices from Sentinel-2
+ndvi = S2.normalizedDifference(['B8', 'B4']).rename('NDVI')   # Normalized Difference Vegetation Index
+ndwi = S2.normalizedDifference(['B3', 'B8']).rename('NDWI')   # Normalized Difference Water Index
+
+# Add spectral indices as additional bands to the Sentinel-2 image
+S2 = S2.addBands(ndvi).addBands(ndwi)
+
+
+# ============================================================
+# STEP 3: Load and Process Sentinel-1 SAR Imagery
+# ============================================================
+
+def mask_edge(image):
+    """Masks extreme low backscatter edge artifacts in Sentinel-1 images.
+
+    Args:
+        image (ee.Image): A Sentinel-1 GRD image.
+
+    Returns:
+        ee.Image: An edge-masked Sentinel-1 image.
+    """
+    edge = image.lt(-30.0)                          # Flag pixels below -30 dB as edge noise
+    masked_image = image.mask().And(edge.Not())     # Combine with existing mask
+    return image.updateMask(masked_image)
+
+
+# Load Sentinel-1 GRD collection:
+#   - Interferometric Wide (IW) swath mode
+#   - VH polarization (sensitive to surface water)
+#   - Descending orbit pass
+S1 = (
+    ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+    .filterDate(start_date, end_date)
+    .filterBounds(AOI)
+    .select(['VH'])         # Select VH polarization band only
+    .map(mask_edge)         # Apply edge artifact masking
+    .median()               # Reduce to median composite
+    .clip(AOI)              # Clip to study area
+)
+
+# Visualize Sentinel-1 SAR backscatter
+m.centerObject(AOI, 12)
+m.add_layer(S1, {'min': -25, 'max': 5}, 'S1 SAR Image', shown=False)
+
+
+# ============================================================
+# STEP 4: Fuse Sentinel-2 and Sentinel-1 into Multi-Band Composite
+# ============================================================
+
+# Concatenate Sentinel-2 (optical bands + spectral indices) and
+# Sentinel-1 (SAR backscatter) into a single multi-band input image
+combinedImage = ee.Image.cat([S2, S1])
+
+# Visualize and inspect the fused image
+m.add_layer(combinedImage, {}, 'Combined S1 + S2', shown=False)
+print('Combined Image:', combinedImage)
+
+
+# ============================================================
+# STEP 5: Extract Training Points from JRC Global Surface Water Dataset
+# ============================================================
+
+# Load JRC Global Surface Water Dataset — 'occurrence' band
+# (represents the % of time each pixel was classified as water)
+JRC = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence').clip(AOI)
+
+# Visualize JRC occurrence layer
+jrc_vis = {
+    'bands':   ['occurrence'],
+    'min':     0.0,
+    'max':     100.0,
+    'palette': ['ffffff', 'ffbbbb', '0000ff'],
+}
+m.add_layer(JRC, jrc_vis, 'JRC Occurrence', shown=False)
+
+
+def extract_training_points(image, name, class_value):
+    """Extracts stratified training sample points from a binary GEE image.
+
+    Args:
+        image (ee.Image): Binary image (1 = target class, masked elsewhere).
+        name (str): Descriptive name for the class (used for labeling).
+        class_value (int): Integer class label (1 = water, 0 = non-water).
+
+    Returns:
+        ee.FeatureCollection: Sampled points with 'waterClass' property assigned.
+    """
+    # Apply self-mask to retain only valid (non-zero) pixels
+    mask = image.updateMask(image)
+
+    # Sample pixels across the AOI
+    training_points = (
+        mask.sample(
+            region=AOI,
+            scale=10,
+            numPixels=1e10,
+            tileScale=1,
+            geometries=True,
+        ).map(lambda feature: feature.set('waterClass', class_value))
+    )
+
+    # Report sample count and visualize on map
+    print(training_points.size().getInfo(), f"{name} training points")
+    m.add_layer(training_points, {'color': 'red'}, f"{name} training points", shown=False)
+
+    return training_points
+
+
+# Define binary water and non-water masks from JRC occurrence
+# Permanent water : occurrence > 75% (high-confidence water pixels)
+# Non-water       : occurrence = 0%  (pixels never observed as water)
+water     = JRC.gt(75).rename('water')
+non_water = JRC.eq(0).rename('non_water')
+
+# Extract training points for each class
+permanent_water_TP = extract_training_points(water,     'Permanent_water', 1).randomColumn()
+non_water_TP       = extract_training_points(non_water, 'non_water',       0).randomColumn()
+
+
+def random_sample(feature_collection, count):
+    """Randomly subsamples a FeatureCollection to a specified maximum count.
+
+    Args:
+        feature_collection (ee.FeatureCollection): Input collection to subsample.
+        count (int): Maximum number of points to retain.
+
+    Returns:
+        ee.FeatureCollection: Randomly subsampled feature collection.
+    """
+    random_column_fc = feature_collection.randomColumn('random')
+    return random_column_fc.sort('random').limit(count)
+
+
+# Limit each class to a maximum of 5,000 training points
+permanent_water_TP = random_sample(permanent_water_TP, 5000)
+non_water_TP       = random_sample(non_water_TP,       5000)
+
+# Merge water and non-water training points into a single collection
+training_points = permanent_water_TP.merge(non_water_TP)
+
+
+# ============================================================
+# STEP 6: Import and Process Dynamic World Water Map (Validation)
+# ============================================================
+
+# Filter the Dynamic World V1 collection by AOI and date range
+col_filter = ee.Filter.And(
+    ee.Filter.bounds(AOI),
+    ee.Filter.date(start_date, end_date),
+)
+
+dw_col   = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filter(col_filter)
+dw_water = dw_col.select('water').mean().clip(AOI)   # Mean water probability [0-1]
+
+# Visualize Dynamic World water probability layer
+dw_vis = {
+    'min':     0,
+    'max':     1,
+    'palette': ['White', '#0000ff'],
+}
+m.add_layer(dw_water, dw_vis, 'Dynamic World Water Map', shown=True)
+
+# Create binary validation masks from Dynamic World
+# Water     : probability > 0.5
+# Non-water : probability = 0
+dw_water_binary     = dw_water.gt(0.5).rename('water')
+dw_non_water        = dw_water.eq(0).rename('non_water')
+
+validation_water_VP     = extract_training_points(dw_water_binary, 'DW_water',     1).randomColumn()
+validation_non_water_VP = extract_training_points(dw_non_water,    'DW_non_water', 0).randomColumn()
+
+# Subsample and merge validation points
+validation_water_VP     = random_sample(validation_water_VP,     1000)
+validation_non_water_VP = random_sample(validation_non_water_VP, 1000)
+validation_points = validation_water_VP.merge(validation_non_water_VP)
+
+
+# ============================================================
+# STEP 7: Extract Image Values at Training Points
+# ============================================================
+
+# Define the seven input feature bands for the classifiers
+bands = ['B2', 'B3', 'B4', 'B8', 'NDVI', 'NDWI', 'VH']
+label = 'waterClass'
+
+# Select only the classification input bands from the fused image
+input_image = combinedImage.select(bands)
+
+# Overlay training points on the input image to extract spectral/SAR values
+training_image_merged = input_image.sampleRegions(
+    collection=training_points,
+    properties=[label],
+    scale=10,
+    geometries=True,
+)
+
+print('Training data with image values:', training_image_merged)
+
+
+# ============================================================
+# STEP 8: Train SVM Classifier and Classify Image
+# ============================================================
+
+# Train a Support Vector Machine (SVM / libsvm) classifier (or you can replace the classifier to RF, GTB nad CART)
+# SVM achieved the highest accuracy in this study: OA = 98.6%, Kc = 0.971
+classifier = ee.Classifier.libsvm().train(
+    features=training_image_merged,
+    classProperty=label,
+    inputProperties=bands,
+)
+
+# Apply the trained classifier to produce the classified surface water map
+classifiedImage = input_image.classify(classifier)
+
+# Visualize the SVM classification output
+class_vis = {
+    'min':     0,
+    'max':     1,
+    'palette': ['White', '#0000ff'],
+}
+SVM_classification = classifiedImage.clip(AOI)
+m.add_layer(SVM_classification, class_vis, 'SVM Classification', shown=True)
+
+
+# ============================================================
+# STEP 9: Post-Processing — Apply Slope and JRC Water Masks
+# ============================================================
+
+# --- 9a. Slope Mask ---
+# Load SRTM DEM and compute terrain slope
+dem   = ee.Image('USGS/SRTMGL1_003').clip(AOI)
+slope = ee.Terrain.slope(dem)
+
+# Retain only pixels with slope < 3 degrees (flat terrain likely indicates water)
+mask_slope = slope.lt(3)
+
+# --- 9b. JRC Maximum Water Extent Mask ---
+# Pixels that have ever been observed as water in the JRC dataset
+gswe           = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('max_extent').clip(AOI)
+max_water_gswe = gswe.eq(1)
+
+# --- 9c. Combine Masks and Refine Classification ---
+# Combined mask: low slope AND historically observed as water
+combined_mask = mask_slope.And(max_water_gswe)
+
+# Extract class layers from classified image
+non_water_class       = classifiedImage.select('classification').eq(0)
+permanent_water_class = classifiedImage.select('classification').eq(1)
+
+# Apply combined mask to constrain permanent water extent
+permanent_masked = permanent_water_class.updateMask(combined_mask)
+
+# Reconstruct the final post-processed classification
+combined_img = (
+    ee.Image(0)
+    .where(non_water_class,  0)
+    .where(permanent_masked, 1)
+    .rename('classification')
+)
+final_result = combined_img.clip(AOI)
+m.add_layer(final_result, class_vis, 'Final Result (Post-Processed)', shown=True)
+m
+
+
+def calculate_area(image, name, geometry):
+    """Calculates the total classified water area in square kilometers.
+
+    Args:
+        image (ee.Image): Binary classified image (1 = water, 0 = non-water).
+        name (str): Descriptive label for the printed output.
+        geometry (ee.Geometry or ee.FeatureCollection): Region to compute area over.
+
+    Returns:
+        tuple: (ee.Image with area band added, ee.Number total area in km2)
+    """
+    # Multiply binary pixel values by per-pixel area in square meters
+    area_img = image.multiply(ee.Image.pixelArea()).rename('area')
+
+    # Sum all pixel areas within the geometry
+    reduced_values = area_img.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geometry,
+        scale=30,          # 30 m scale reduces computation time
+        maxPixels=1e50,
+    )
+
+    # Convert from square meters to square kilometers and round
+    sq_m  = ee.Number(reduced_values.get('area'))
+    sq_km = sq_m.divide(1e6).round()
+
+    print(f'Area of {name}:', sq_km.getInfo(), 'km2')
+
+    # Optionally return image with area band appended
+    image_with_area = image.addBands(area_img.rename('area_km2'))
+
+    return image_with_area, sq_km
+
+
+# Calculate total surface water area from the final post-processed result
+classified_water = final_result.eq(1)
+water_area_result = calculate_area(
+    image=classified_water,
+    name='Surface Water',
+    geometry=AOI,
+)
+
+
+# ============================================================
+# STEP 10: Accuracy Assessment
+# ============================================================
+
+# Overlay validation points on the final classified image to extract predicted labels
+test = final_result.sampleRegions(
+    collection=validation_points,
+    properties=[label],
+    scale=10,
+)
+
+# Compute the confusion matrix: rows = reference, columns = predicted
+confusion_matrix = test.errorMatrix('waterClass', 'classification')
+
+# Print all accuracy metrics
+print('Confusion Matrix:',         confusion_matrix.getInfo())
+print('Overall Accuracy (OA):',    confusion_matrix.accuracy().getInfo())
+print("Producer's Accuracy (PA):", confusion_matrix.producersAccuracy().getInfo())
+print("User's Accuracy (UA):",     confusion_matrix.consumersAccuracy().getInfo())
+print('Kappa Coefficient (Kc):',   confusion_matrix.kappa().getInfo())
