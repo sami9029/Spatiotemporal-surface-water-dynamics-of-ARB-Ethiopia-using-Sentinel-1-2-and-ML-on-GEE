@@ -4,9 +4,7 @@
 ## 📌 About
 
 This repository contains the Python implementation of an automated surface water mapping framework built on the Google Earth Engine (GEE) for the Awash River Basin (ARB), Ethiopia .
-
 The framework fuses Sentinel-1 SAR and Sentinel-2 MSI imagery with automatically collected training and validation samples from the JRC Global Surface Water Dataset (JRC-GSWD) and Dynamic World (DW), respectively. Four machine learning classifiers — RF, SVM, GTB, and CART — are comparatively evaluated. SVM achieved the best performance (OA = 98.6%, Kc = 0.971).
----
 
 ## Study Area
 
