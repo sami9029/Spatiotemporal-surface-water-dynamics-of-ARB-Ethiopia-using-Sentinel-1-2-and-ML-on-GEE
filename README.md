@@ -1,0 +1,2 @@
+# Spatiotemporal-surface-water-dynamics-of-ARB-Ethiopia-using-Sentinel-1-2-and-ML-on-GEE
+An automated GEE-based framework for spatiotemporal surface water mapping (2016–2025) in the Awash River Basin, Ethiopia. Integrates Sentinel-1 SAR and Sentinel-2 MSI imagery with four machine learning classifiers (RF, SVM, GTB, CART). Training and validation samples are automatically extracted from JRC-GSWD and Dynamic World datasets .
